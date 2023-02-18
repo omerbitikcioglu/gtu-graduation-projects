@@ -1,0 +1,198 @@
+---
+title: "Analysis of Anti-Vaccine Community on Twitter"
+output: 
+    html_document: 
+      toc: true
+---
+
+```{r message=FALSE, warning=FALSE, echo=FALSE}
+library(ggplot2) # Data visualization
+library(readr) # CSV file I/O, e.g. the read_csv function
+library(dplyr)
+library(reshape2)
+library(tidyr)
+library(formattable)
+library(RColorBrewer)
+library(lubridate)
+library(networkD3)
+library(plotly)
+library(cluster)
+library(viridis)
+library(stringr)
+library(listviewer)
+knitr::opts_chunk$set(message=FALSE, warning=FALSE, echo = FALSE)
+tweets <- rjson::fromJSON(file = "input/temp_2k.json")
+
+```
+
+```{r warning=FALSE, echo=FALSE}
+#View(tweets)
+#listviewer::jsonedit(tweets, height = "800px", mode = "view")
+tws <- tibble(tweet = tweets)
+tweets <- tws %>% unnest_wider(tweet)
+tweets <- tweets %>% mutate(is_retweet = NA)
+for (i in 1:nrow(tweets)) { 
+  tweets[i,]=tweets[i,]%>%
+  mutate(is_retweet = ifelse(grepl("^\\bRT\\b", tweets[i,2]), "Retweets", "Originaltweets"))
+}
+```
+
+#Find the influencers
+To understand the fanbase, let's look at their number of tweets vs number of follower to get a sense of their activity level and influence.   
+Based on k-mean clustering withinness, we segment their user attributes into 4 groups
+```{r fig.height=3,fid.width=6, echo=FALSE}
+users <- unnest_wider(tweets["user"], user)
+#View(users)
+fanbase=users%>%
+select(name,followers_count,statuses_count)%>%
+group_by(name)%>%
+summarize(n_follower=max(followers_count),n_tweet=max(statuses_count))
+
+wss <- numeric(15)
+for (k in 1:15) {wss[k] <- sum(kmeans(as.matrix(fanbase[, 2:3]), centers=k,nstart=25,iter.max=30)$withinss)}
+
+set.seed(20)
+AntiVaxCluster <- kmeans(as.matrix(fanbase[, 2:3]), 4, nstart = 20)
+```
+
+Visualize it with a scatter plot
+```{r}
+scatter=fanbase%>%
+ggplot(aes(n_tweet,n_follower))+
+geom_point(aes(color=factor(AntiVaxCluster$cluster)))+
+geom_text(aes(label=ifelse((n_follower>500000&n_tweet>1000)|(n_follower>50000&n_tweet>100000),as.character(name),'')),vjust=1.5)+
+guides(color="none")+
+ggtitle('Tweet Activity vs Influence')
+ggplotly()
+```
+
+##activity types
+```{r}
+tweets%>%group_by(is_retweet)%>%
+summarize(n_tweet=n())%>%
+head()
+```
+
+##mentions
+Let's also top handles mentioned  
+
+```{r mention}
+mention=tweets%>%
+  mutate(mention=str_extract_all(tweets[["full_text"]], "@\\w+"))%>%
+  select(mention)%>%
+  filter(!is.na(mention))%>%
+  unnest(mention)%>%
+  group_by(mention)%>%
+  summarize(n_mention=n())%>%
+  arrange(desc(n_mention))
+mention%>%
+  head(10)
+```
+#extract mention network
+```{r warning=FALSE}
+library(visNetwork)
+user=users%>%
+select(screen_name)%>%
+unique()
+tweets <- tweets %>% mutate(username=users$name)
+edges=tweets %>%
+  select(from=username, full_text)%>%
+  mutate(to = str_extract_all(full_text, '(?<=@)\\w+')) %>%
+  filter(to!='character(0)') %>%
+  select(-full_text)%>%
+  unnest(to)%>%
+  mutate(flag=to%in%user$screen_name)%>%
+  filter(flag==TRUE)%>%
+  select(-flag)%>%
+  group_by(from,to) %>% tally()
+
+nodes=data.frame(id=unique( union(unique(edges$from), unique(edges$to))))
+nodes$title <-nodes$id
+edges$arrows <-'to'
+edges$width<- (edges$n)^(1/3)
+network <- visNetwork(nodes, edges)%>%
+  visOptions(highlightNearest = TRUE)%>%
+  visPhysics(stabilization = FALSE)%>%
+  visEdges(smooth = FALSE)%>%
+  visIgraphLayout()
+network
+```
+#Spectral Clustering of the Network
+```{r}
+spectral_clustering <- function(X, # matrix of data points
+                                nn = 10, # the k nearest neighbors to consider
+                                n_eig = 2) # m number of eignenvectors to keep
+{
+  mutual_knn_graph <- function(X, nn = 10)
+  {
+    D <- as.matrix( dist(X) ) # matrix of euclidean distances between data points in X
+    
+    # intialize the knn matrix
+    knn_mat <- matrix(0,
+                      nrow = nrow(X),
+                      ncol = nrow(X))
+    
+    # find the 10 nearest neighbors for each point
+    for (i in 1: nrow(X)) {
+      neighbor_index <- order(D[i,])[2:(nn + 1)]
+      knn_mat[i,][neighbor_index] <- 1 
+    }
+   
+    # Now we note that i,j are neighbors iff K[i,j] = 1 or K[j,i] = 1 
+    knn_mat <- knn_mat + t(knn_mat) # find mutual knn
+    
+    knn_mat[ knn_mat == 2 ] = 1
+    
+    return(knn_mat)
+  }
+  
+  graph_laplacian <- function(W, normalized = TRUE)
+  {
+    stopifnot(nrow(W) == ncol(W)) 
+    
+    g = colSums(W) # degrees of vertices
+    n = nrow(W)
+    
+    if(normalized)
+    {
+      D_half = diag(1 / sqrt(g) )
+      return( diag(n) - D_half %*% W %*% D_half )
+    }
+    else
+    {
+      return( diag(g) - W )
+    }
+  }
+  
+  W = mutual_knn_graph(X) # 1. matrix of similarities
+  L = graph_laplacian(W) # 2. compute graph laplacian
+  ei = eigen(L, symmetric = TRUE) # 3. Compute the eigenvectors and values of L
+  n = nrow(L)
+  return(ei$vectors[,(n - n_eig):(n - 1)]) # return the eigenvectors of the n_eig smallest eige nvalues
+
+}
+coords_x <- network$x$nodes$x
+coords_y <- network$x$nodes$y
+mdata <- cbind(coords_x, coords_y) # matrix of data points
+
+# do spectral clustering procedure
+
+X_sc <- spectral_clustering(mdata)
+
+# run kmeans on the 2 eigenvectors
+X_sc_kmeans <- kmeans(X_sc, 2)
+
+clusters <- X_sc_kmeans$cluster
+nodes["cluster"] <- clusters
+nodes=data.frame(id=unique( union(unique(edges$from), unique(edges$to))),
+                 color=ifelse(nodes$cluster==1,"green", "orange"))
+
+network <- visNetwork(nodes, edges)%>%
+  visOptions(highlightNearest = TRUE)%>%
+  visPhysics(stabilization = FALSE)%>%
+  visEdges(smooth = FALSE)%>%
+  visIgraphLayout()
+network
+
+```
+
